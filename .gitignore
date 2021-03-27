@@ -1,0 +1,4 @@
+*.dataset
+**/experiments/
+**/results/
+**/SRbenchmark/
