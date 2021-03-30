@@ -1,135 +1,65 @@
-import argparse, random
-from tqdm import tqdm
-
 import torch
-
+import torch.nn as nn
+import os.path as osp
 import os
-import options.options as option
-from utils import util
-from solvers import create_solver
-from data import create_dataloader
-from data import create_dataset
+import numpy as np
+from PIL import Image
+from torchvision.transforms import ToTensor
+from collections import OrderedDict
 
-os.environ["CUDA_VISIBLE_DEVICES"] = "0"
+device = torch.device("cpu")
 
-def main():
-    parser = argparse.ArgumentParser(description='Train Super Resolution Models')
-    #	parser.add_argument('-opt', type=str, required=True, help='Path to options JSON file.')
-    #	opt = option.parse(parser.parse_args().opt)
-    # opt = option.parse('options/train/train_SRFBN_DN.json')
-    opt = option.parse('options/train/train_SRFBN_BD.json')
+pretrained = '../SRFBN_x4_BI.pth'
+mine = '../last_ckp.pth'
+from networks.srfbn_arch import SRFBN
+nguoita = SRFBN(in_channels=3, out_channels=3,
+                            num_features=64, num_steps=4, num_groups=6,
+                            upscale_factor=4)
+tao = SRFBN(in_channels=3, out_channels=3,
+                            num_features=64, num_steps=4, num_groups=6,
+                            upscale_factor=4)
+# nguoita = nn.DataParallel(nguoita).cuda()
+# tao = nn.DataParallel(tao).cuda()
+new_state_dict = OrderedDict()
+pretrained = torch.load(pretrained, map_location=device)
+for k, v in pretrained['state_dict'].items():
+    name = k[7:] # remove `module.`
+    new_state_dict[name] = v.cpu()
+nguoita.load_state_dict(new_state_dict)
+mine = torch.load(mine, map_location=device)
+for k, v in mine['state_dict'].items():
+    name = k[7:] # remove `module.`
+    new_state_dict[name] = v.cpu()
+tao.load_state_dict(new_state_dict)
+# print(type(tao))
 
-    # random seed
-    seed = opt['solver']['manual_seed']
-    if seed is None: seed = random.randint(1, 10000)
-    print("===> Random Seed: [%d]"%seed)
-    random.seed(seed)
-    torch.manual_seed(seed)
+pretrained_folder = './visualize_SRFBN_mine'
+if not osp.exists(pretrained_folder):
+    os.mkdir(pretrained_folder)
+min_folder = './visualize_SRFBN_notmine'
+if not osp.exists(min_folder):
+    os.mkdir(min_folder)
 
-    # create train and val dataloader
-    for phase, dataset_opt in sorted(opt['datasets'].items()):
-        if phase == 'train':
-            train_set = create_dataset(dataset_opt)
-            train_loader = create_dataloader(train_set, dataset_opt)
-            print('===> Train Dataset: %s   Number of images: [%d]' % (train_set.name(), len(train_set)))
-            if train_loader is None: raise ValueError("[Error] The training data does not exist")
+#prepare data
+folder = '../SRbenchmark/LR_x4'
 
-        elif phase == 'val':
-            val_set = create_dataset(dataset_opt)
-            val_loader = create_dataloader(val_set, dataset_opt)
-            print('===> Val Dataset: %s   Number of images: [%d]' % (val_set.name(), len(val_set)))
-
-        else:
-            raise NotImplementedError("[Error] Dataset phase [%s] in *.json is not recognized." % phase)
-
-    solver = create_solver(opt)
-
-    scale = opt['scale']
-    model_name = opt['networks']['which_model'].upper()
-
-    print('===> Start Train')
-    print("==================================================")
-
-    solver_log = solver.get_current_log()
-
-    NUM_EPOCH = int(opt['solver']['num_epochs'])
-    start_epoch = solver_log['epoch']
-
-    print("Method: %s || Scale: %d || Epoch Range: (%d ~ %d)"%(model_name, scale, start_epoch, NUM_EPOCH))
-
-    for epoch in range(start_epoch, NUM_EPOCH + 1):
-        print('\n===> Training Epoch: [%d/%d]...  Learning Rate: %f'%(epoch,
-                                                                      NUM_EPOCH,
-                                                                      solver.get_current_learning_rate()))
-
-        # Initialization
-        solver_log['epoch'] = epoch
-
-        # Train model
-        train_loss_list = []
-        with tqdm(total=len(train_loader), desc='Epoch: [%d/%d]'%(epoch, NUM_EPOCH), miniters=1) as t:
-            for iter, batch in enumerate(train_loader):
-                solver.feed_data(batch, is_train=True, is_complex=True)
-                iter_loss = solver.train_step(is_complex=True)
-                batch_size = batch['LR'].size(0)
-                train_loss_list.append(iter_loss*batch_size)
-                t.set_postfix_str("Batch Loss: %.4f" % iter_loss)
-                t.update()
-
-        solver_log['records']['train_loss'].append(sum(train_loss_list)/len(train_set))
-        solver_log['records']['lr'].append(solver.get_current_learning_rate())
-
-        print('\nEpoch: [%d/%d]   Avg Train Loss: %.6f' % (epoch,
-                                                    NUM_EPOCH,
-                                                    sum(train_loss_list)/len(train_set)))
-
-        print('===> Validating...',)
-
-        psnr_list = []
-        ssim_list = []
-        val_loss_list = []
-
-        for iter, batch in enumerate(val_loader):
-            solver.feed_data(batch, is_train=False)
-            iter_loss = solver.test()
-            val_loss_list.append(iter_loss)
-
-            # calculate evaluation metrics
-            visuals = solver.get_current_visual()
-            psnr, ssim = util.calc_metrics(visuals['SR'], visuals['HR'], crop_border=scale, test_Y=True)
-            psnr_list.append(psnr)
-            ssim_list.append(ssim)
-
-            if opt["save_image"]:
-                solver.save_current_visual(epoch, iter)
-
-        solver_log['records']['val_loss'].append(sum(val_loss_list)/len(val_loss_list))
-        solver_log['records']['psnr'].append(sum(psnr_list)/len(psnr_list))
-        solver_log['records']['ssim'].append(sum(ssim_list)/len(ssim_list))
-
-        # record the best epoch
-        epoch_is_best = False
-        if solver_log['best_pred'] < (sum(psnr_list)/len(psnr_list)):
-            solver_log['best_pred'] = (sum(psnr_list)/len(psnr_list))
-            epoch_is_best = True
-            solver_log['best_epoch'] = epoch
-
-        print("[%s] PSNR: %.2f   SSIM: %.4f   Loss: %.6f   Best PSNR: %.2f in Epoch: [%d]" % (val_set.name(),
-                                                                                              sum(psnr_list)/len(psnr_list),
-                                                                                              sum(ssim_list)/len(ssim_list),
-                                                                                              sum(val_loss_list)/len(val_loss_list),
-                                                                                              solver_log['best_pred'],
-                                                                                              solver_log['best_epoch']))
-
-        solver.set_current_log(solver_log)
-        solver.save_checkpoint(epoch, epoch_is_best)
-        solver.save_current_log()
-
-        # update lr
-        solver.update_learning_rate(epoch)
-
-    print('===> Finished !')
-
-
-if __name__ == '__main__':
-    main()
+# print(next(tao.parameters()).is_cuda)
+imgs = os.listdir(folder)
+for img in imgs:
+    name, ext = img.split('.')
+    img = Image.open(osp.join(folder, img))
+    img = np.array(img).astype(np.uint8)
+    img = ToTensor()(img)
+    img = img.to(device)
+    
+    img = torch.unsqueeze(img, 0)
+    print(img.is_cuda)
+    print(next(nguoita.parameters()).is_cuda)
+    nguoita_hr = nguoita(img)
+    tao_hr = tao(img)
+    nguoita_hr = nguoita_hr.numpy()
+    tao_hr = tao_hr.numpy()
+    nguoita_hr = Image.fromarray(nguoita_hr.astype(np.uint8))
+    nguoita_hr.save('{}/{}_nguoita.png'.format(pretrained_folder, name))
+    tao_hr = Image.fromarray(tao_hr.astype(np.uint8))
+    tao_hr.save('{}/{}_tao.png'.format(min_folder, name))
